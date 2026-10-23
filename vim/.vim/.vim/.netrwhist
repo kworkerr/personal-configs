@@ -1,0 +1,8 @@
+let g:netrw_dirhistmax  =10
+let g:netrw_dirhistcnt =6
+let g:netrw_dirhist_6='/home/k/dev/vindlinux/logos'
+let g:netrw_dirhist_5='/home/k/dev/vind-packages/database/alsa-lib'
+let g:netrw_dirhist_4='/home/k/dev/dvd'
+let g:netrw_dirhist_3='/home/k/dev/vind-packages/database/pipewire'
+let g:netrw_dirhist_2='/home/gumi/dev/vind-packages/database/util-linux'
+let g:netrw_dirhist_1='/home/gumi/.vim/after/ftplugin'

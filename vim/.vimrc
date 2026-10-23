@@ -22,3 +22,11 @@ set shiftwidth=4
 set softtabstop=4
 set autoindent
 set scrolloff=999
+
+augroup discord_presence
+    autocmd!
+    autocmd BufEnter * call writefile(
+        \ [expand('%:t')],
+        \ expand('~/.cache/vim-presence')
+        \ )
+augroup END
