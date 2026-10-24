@@ -185,65 +185,25 @@ The current hook tracks buffer changes, not whether Vim is still open. Consequen
 
 ## 4. Configure arRPC
 
-Run the arRPC server:
+Run arRPC:
 
 ```sh
 npx --yes arrpc
 ```
 
-Keep it running during the initial test. The server normally listens on local endpoints for IPC and WebSocket communication.
-
-For the final setup, it will be launched automatically by dwl.
-
-### Create a persistent bridge script
-
-Download the bridge example from the official arRPC repository:
-
-```sh
-mkdir -p ~/.local/share/vim-presence
-
-curl -fsSL \
-    https://raw.githubusercontent.com/OpenAsar/arrpc/main/examples/bridge_mod.js \
-    -o /tmp/bridge_mod.js
-```
-
-The current setup uses an experimental adjustment to the Dispatcher's detection. Apply it to the downloaded script:
-
-```sh
-sed -i "/typeof candidate.subscribe === 'function'/a\\        \\&\\& Array.isArray(candidate._waitQueue)" \
-    /tmp/bridge_mod.js
-```
-
-Check that the new condition exists:
-
-```sh
-grep -A4 -B2 '_waitQueue' /tmp/bridge_mod.js
-```
-
-Save the corrected copy:
-
-```sh
-cp /tmp/bridge_mod.js \
-    ~/.local/share/vim-presence/bridge_mod.js
-```
-
-This is a compatibility workaround, not a guaranteed permanent fix. If arRPC changes its implementation, the patch may need to be reviewed.
+Keep it running during the initial test. It will be launched automatically by dwl later.
 
 ## 5. Configure Firefox and Violentmonkey
 
-Install [Violentmonkey for Firefox](https://addons.mozilla.org/firefox/addon/violentmonkey/).
+Install [Violentmonkey for Firefox](https://addons.mozilla.org/firefox/addon/violentmonkey/). Create a new userscript and replace its entire contents with the code below.
 
-Create a userscript that loads the bridge automatically on Discord Web.
+This is the working bridge version for this setup. It retries discovering Discord's internal modules for up to 10 seconds. Discord Web's internal code can change without notice, so the bridge may need future maintenance.
 
-Generate the userscript file:
-
-```sh
-{
-    cat <<'EOF'
+```js
 // ==UserScript==
 // @name         arRPC Bridge - Discord Web
 // @namespace    local.vim-presence
-// @version      1.0.0
+// @version      1.1.0
 // @description  Connect Discord Web to local arRPC
 // @match        https://discord.com/*
 // @run-at       document-idle
@@ -251,33 +211,203 @@ Generate the userscript file:
 // @grant        none
 // @noframes
 // ==/UserScript==
-EOF
-    cat ~/.local/share/vim-presence/bridge_mod.js
-} > ~/.local/share/vim-presence/arrpc-bridge.user.js
+
+(() => {
+    'use strict';
+
+    let Dispatcher;
+    let lookupAsset;
+    let lookupApp;
+    const apps = {};
+
+    console.log('[Vim Presence] Userscript iniciado');
+
+    const eachCandidate = (mod, fn) => {
+        if (!mod) return;
+        try { fn(mod); } catch {}
+        try { if (mod.default) fn(mod.default); } catch {}
+        try {
+            for (const key of Reflect.ownKeys(mod)) {
+                try { fn(mod[key]); } catch {}
+            }
+        } catch {}
+    };
+
+    const getWebpackRequire = () => {
+        const chunks = window.webpackChunkdiscord_app;
+        if (!chunks || typeof chunks.push !== 'function') return null;
+
+        const reqs = [];
+        chunks.push([
+            [`vim-presence-${Date.now()}`],
+            {},
+            req => { if (req) reqs.push(req); }
+        ]);
+        chunks.pop();
+
+        const hasSource = (req, ...needles) => {
+            for (const id in req?.m) {
+                let source;
+                try { source = req.m[id]?.toString?.(); } catch { continue; }
+                if (source && needles.every(s => source.includes(s))) return true;
+            }
+            return false;
+        };
+
+        return reqs.find(req =>
+            hasSource(req, 'getAssetImage: size must === [') &&
+            hasSource(req, 'Invalid Origin', 'coverImage', '.application')
+        ) || reqs.at(-1) || null;
+    };
+
+    const findModule = (req, ...needles) => {
+        if (!req?.m) return;
+        for (const id in req.m) {
+            let source;
+            try { source = req.m[id]?.toString?.(); } catch { continue; }
+            if (!source || !needles.every(s => source.includes(s))) continue;
+            try { return req(id); } catch {}
+        }
+    };
+
+    const findInCache = (req, test, depth = 4) => {
+        if (!req?.c) return;
+        const seen = new WeakSet();
+        let found;
+
+        const walk = (value, remainingDepth) => {
+            if (found || !value ||
+                (typeof value !== 'object' && typeof value !== 'function')) return;
+            if (value === window || value === document ||
+                value === globalThis || seen.has(value)) return;
+
+            seen.add(value);
+            try {
+                if (test(value)) { found = value; return; }
+            } catch {}
+            if (!remainingDepth) return;
+            eachCandidate(value, item => walk(item, remainingDepth - 1));
+        };
+
+        for (const id in req.c) {
+            const mod = req.c[id]?.exports;
+            if (!mod) continue;
+            walk(mod, depth);
+            if (found) return found;
+        }
+    };
+
+    const discoverInternals = async () => {
+        for (let attempt = 0; attempt < 40; attempt++) {
+            try {
+                const req = getWebpackRequire();
+
+                if (req && !Dispatcher) {
+                    Dispatcher = findInCache(req, candidate =>
+                        typeof candidate?.dispatch === 'function' &&
+                        typeof candidate?.subscribe === 'function' &&
+                        Array.isArray(candidate._waitQueue)
+                    );
+                }
+
+                if (req && !lookupAsset) {
+                    const mod = findModule(req, 'getAssetImage: size must === [');
+                    eachCandidate(mod, candidate => {
+                        if (typeof candidate !== 'function') return;
+                        const source = candidate.toString();
+                        if (source.includes('APPLICATION_ASSETS_FETCH_SUCCESS') &&
+                            source.includes('startsWith("http:")')) {
+                            lookupAsset = async (appId, name) =>
+                                (await candidate(appId, [name]))[0];
+                        }
+                    });
+                }
+
+                if (req && !lookupApp) {
+                    const mod = findModule(req, 'Invalid Origin', 'coverImage', '.application');
+                    eachCandidate(mod, candidate => {
+                        if (typeof candidate !== 'function') return;
+                        const source = candidate.toString();
+                        if (source.includes('Invalid Origin') &&
+                            source.includes('coverImage') &&
+                            source.includes('.application')) {
+                            lookupApp = async appId => {
+                                const socket = {};
+                                await candidate(socket, appId);
+                                return socket.application;
+                            };
+                        }
+                    });
+                }
+
+                if (Dispatcher && lookupAsset && lookupApp) {
+                    console.log('[Vim Presence] Discord internals encontrados');
+                    return true;
+                }
+            } catch (err) {
+                console.warn('[Vim Presence] Tentativa de descoberta falhou', err);
+            }
+
+            await new Promise(resolve => setTimeout(resolve, 250));
+        }
+
+        console.error('[Vim Presence] Não foi possível localizar:', {
+            Dispatcher: !!Dispatcher,
+            lookupAsset: !!lookupAsset,
+            lookupApp: !!lookupApp
+        });
+        return false;
+    };
+
+    const ws = new WebSocket('ws://127.0.0.1:1337');
+
+    ws.addEventListener('open', () =>
+        console.log('[Vim Presence] Conectado ao arRPC'));
+    ws.addEventListener('error', () =>
+        console.error('[Vim Presence] Erro no WebSocket do arRPC'));
+    ws.addEventListener('close', event =>
+        console.warn('[Vim Presence] WebSocket fechado:', event.code, event.reason));
+
+    ws.onmessage = async event => {
+        try {
+            const msg = JSON.parse(event.data);
+
+            if (!await discoverInternals()) {
+                throw new Error('Discord internals indisponíveis');
+            }
+
+            if (msg.activity?.assets?.large_image) {
+                msg.activity.assets.large_image = await lookupAsset(
+                    msg.activity.application_id, msg.activity.assets.large_image);
+            }
+            if (msg.activity?.assets?.small_image) {
+                msg.activity.assets.small_image = await lookupAsset(
+                    msg.activity.application_id, msg.activity.assets.small_image);
+            }
+
+            if (msg.activity) {
+                const appId = msg.activity.application_id;
+                if (!apps[appId]) apps[appId] = await lookupApp(appId);
+                if (!msg.activity.name) msg.activity.name = apps[appId].name;
+            }
+
+            Dispatcher.dispatch({ type: 'LOCAL_ACTIVITY_UPDATE', ...msg });
+        } catch (err) {
+            console.error('[Vim Presence] Falha ao atualizar atividade:', err);
+        }
+    };
+})();
 ```
 
-Copy the file's contents to the clipboard:
+Save the script and check the following:
 
-```sh
-wl-copy < ~/.local/share/vim-presence/arrpc-bridge.user.js
-```
+1. **Enable** is on.
+2. **Run-At** is `document-idle`.
+3. **Injection mode** is `page`.
+4. Firefox has permission to let `discord.com` access other apps and services on the device.
+5. Reload Discord Web with `Ctrl + Shift + R`.
 
-Then:
-
-1. Open Violentmonkey's dashboard in Firefox.
-2. Create a new userscript.
-3. Replace its contents with the copied script.
-4. Save it and ensure it is enabled.
-
-The `@inject-into page` directive is important because the bridge needs access to JavaScript objects belonging to Discord Web.
-
-### Allow local application access
-
-When Firefox asks whether `discord.com` may access other apps and services on the device, allow it.
-
-This permission is necessary for the browser to communicate with the local arRPC service. Without it, the bridge may connect and then disconnect.
-
-Reload Discord Web after enabling the userscript and granting permission.
+The `@inject-into page` directive is essential: the bridge needs access to Discord Web's JavaScript objects.
 
 ## 6. Test the complete setup
 
@@ -364,7 +494,7 @@ A successful browser connection should produce a message resembling:
 [arRPC > bridge] web connected
 ```
 
-If the bridge immediately disconnects, check the Firefox permission and verify that `@inject-into page` is present in the userscript.
+If the bridge immediately disconnects, check the Firefox permission and verify that `@inject-into page` is present. In the Firefox Console, look for `[Vim Presence] Conectado ao arRPC`, `[Vim Presence] Discord internals encontrados`, or `[Vim Presence] Não foi possível localizar`; the last message lists which internal components were not found.
 
 ### Check the Node.js log
 
@@ -405,4 +535,3 @@ For normal operation, avoid starting additional copies when the autostart proces
 - [Violentmonkey metadata documentation](https://violentmonkey.github.io/api/metadata-block/)
 - [Violentmonkey injection contexts](https://violentmonkey.github.io/posts/inject-into-context/)
 - [@xhayper/discord-rpc on npm](https://www.npmjs.com/package/@xhayper/discord-rpc)
-
